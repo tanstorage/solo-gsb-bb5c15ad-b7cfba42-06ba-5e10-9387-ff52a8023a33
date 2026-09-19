@@ -45,6 +45,12 @@
   不写入修订、不占用 `request_id`（修正后可用同 ID 重试）；
 - 删除契约后，PATCH 立即恢复为无契约的原更新行为。
 
+需要审计“两个修订之间到底改了什么”时，可用
+**`GET /documents/{id}/diff?from_revision=&to_revision=` 修订差异**：
+递归比较两个已存在快照，按 RFC 6901 路径稳定排序返回 `add` / `remove` / `replace`
+变更，每项同时给出 `before` / `after`，并用 `missing` 区分“键缺失”与真实 `null`；
+数组作为整体值比较，响应附各操作计数，无差异时返回空数组。
+
 ## 一键启动
 
 需要 Docker 与 Docker Compose v2：
@@ -97,6 +103,7 @@ docker compose down -v       # 停止并删除数据卷
 | `POST` | `/releases` | 原子发布 2～20 个文档更新（单事务、聚合失败、整批幂等） |
 | `GET` | `/documents/{id}/revisions` | 修订历史（支持 `limit`/`offset`/`order=asc|desc`） |
 | `GET` | `/documents/{id}/revisions/{rev}` | 查询指定修订的内容与 patch |
+| `GET` | `/documents/{id}/diff?from_revision=&to_revision=` | 两个修订快照的递归结构差异（add/remove/replace，附计数） |
 | `PUT` | `/documents/{id}/schema` | 设置 / 替换 JSON Schema 2020-12 契约 |
 | `GET` | `/documents/{id}/schema` | 查询当前契约（未设置返回 `404 schema_not_found`） |
 | `DELETE` | `/documents/{id}/schema` | 删除契约（幂等，删除后恢复原更新行为） |
@@ -380,6 +387,56 @@ curl http://localhost:8000/documents/demo/revisions/3
 历史列表为轻量条目（修订号、基线号、request_id、是否重放、作者、时间）；
 单条修订详情含完整 `content`、原始 `patch` 与重放标记。
 
+### 修订差异（GET /documents/{id}/diff）
+
+只读审计接口：递归比较**两个已存在修订**的快照，返回结构差异。
+`from_revision` 与 `to_revision` 均为必填查询参数（`>= 1`），方向任意
+（正反向比较均可，反向时 add/remove 互换）。
+
+```bash
+# 历史：rev1 {"a":1,"b":2,"c":{"x":1}} → rev2 a=100 → rev3 删 b、c 加 y
+curl 'http://localhost:8000/documents/demo/diff?from_revision=1&to_revision=3'
+```
+
+```json
+{
+  "document_id": "demo",
+  "from_revision": 1,
+  "to_revision": 3,
+  "changes": [
+    {"op": "replace", "path": "/a",   "before": 1, "after": 100, "missing": []},
+    {"op": "remove",  "path": "/b",   "before": 2, "after": null, "missing": ["after"]},
+    {"op": "add",     "path": "/c/y", "before": null, "after": 2, "missing": ["before"]}
+  ],
+  "counts": {"add": 1, "remove": 1, "replace": 1, "total": 3}
+}
+```
+
+变更项语义：
+
+- `changes` 按 **RFC 6901 路径**（键序列）稳定排序：父路径先于子路径，
+  同级按键名字典序；`path` 为 JSON Pointer，根为 `""`，
+  键中的 `~`/`/` 转义为 `~0`/`~1`；
+- 两侧都是对象时按键递归；其余情况（标量不同、类型变化、**数组不同**）
+  在该路径整体 `replace`——数组作为整体值比较，不按下标展开；
+- `before` / `after` 同时给出该路径变更前后的值；键缺失的一侧值为 `null`
+  并在 `missing` 中标注（`add` 标 `before`、`remove` 标 `after`），
+  以区别于真实存储的 JSON `null`（真实 `null` 参与的变更 `missing` 为 `[]`）；
+- `counts` 按操作类型计数并附 `total`；两快照无差异时 `changes` 为 `[]`、
+  各项计数为 0（`from_revision == to_revision` 也是合法的空差异）。
+
+错误情况：
+
+- 文档不存在 → `404 not_found`；
+- 任一修订不存在 → `404 revision_not_found`，`missing_revisions` 指出缺失的修订号：
+
+  ```json
+  {"detail": {"error": "revision_not_found", "document_id": "demo",
+    "from_revision": 1, "to_revision": 99, "missing_revisions": [99]}}
+  ```
+
+- 参数缺失或小于 1 → `422`（请求校验错误）。
+
 ## JSON Schema 契约（可选）
 
 每个文档最多一个契约，遵循 [JSON Schema 2020-12](https://json-schema.org/draft/2020-12)
@@ -504,6 +561,7 @@ HTTP/1.1 422 Unprocessable Entity
 | `200` | 更新成功（含幂等重放）、契约查询 / 设置 / 删除成功 |
 | `201` | 文档创建成功 |
 | `404 not_found` | 文档不存在（契约接口同理） |
+| `404 revision_not_found` | 修订差异比较时 from/to 修订不存在（`missing_revisions` 指出缺失项）；单条修订查询同理 |
 | `404 schema_not_found` | 文档存在但未设置契约（GET） |
 | `409 conflict` | 三方合并存在分歧路径（原子发布单项失败时聚合在 `failures` 中） |
 | `409 revert_conflict` | 撤销目标修订涉及的路径后来被改成不同值（不写新修订、不占用 request_id） |
@@ -521,8 +579,9 @@ HTTP/1.1 422 Unprocessable Entity
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、冲突响应、契约接口）
+│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、冲突响应、契约/差异接口）
 │   ├── merge.py       # RFC 7386 打补丁 + 递归三方合并（无框架依赖，可单测）
+│   ├── diff.py        # 两快照递归结构差异 add/remove/replace（无框架依赖，可单测）
 │   ├── validation.py  # JSON Schema 2020-12 元校验与实例校验（错误稳定排序）
 │   ├── db.py          # SQLite 连接、自动建表、文档/修订/幂等/契约表读写
 │   ├── schemas.py     # Pydantic 请求模型（额外字段拒绝）
@@ -532,7 +591,8 @@ HTTP/1.1 422 Unprocessable Entity
 │   ├── test_api.py       # API 集成测试（23 例，独立临时数据库）
 │   ├── test_contracts.py # 契约接口与 PATCH 校验集成测试（19 例）
 │   ├── test_reverts.py   # POST /documents/{id}/reverts 撤销集成测试（25 例）
-│   └── test_releases.py  # POST /releases 原子发布集成测试（17 例）
+│   ├── test_releases.py  # POST /releases 原子发布集成测试（17 例）
+│   └── test_diff.py      # 差异算法单元测试 + GET /documents/{id}/diff 集成测试（20 例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 from . import db
 from .config import settings
+from .diff import diff_counts, diff_documents
 from .merge import (
     apply_merge_patch,
     merge_patch_diff,
@@ -39,7 +40,8 @@ app = FastAPI(
     title="共享 JSON 配置三方合并 API",
     version="1.2.0",
     description="基于 JSON Merge Patch (RFC 7386) 的共享配置存储；"
-    "基线过期时递归三方合并，路径冲突返回 409；支持按修订号逆向撤销。",
+    "基线过期时递归三方合并，路径冲突返回 409；支持按修订号逆向撤销；"
+    "支持任意两修订间的递归结构差异审计。",
     lifespan=lifespan,
 )
 
@@ -385,6 +387,55 @@ def get_one_revision(
         "replayed": bool(row["replayed"]),
         "author": row["author"],
         "created_at": row["created_at"],
+    }
+
+
+# ---------------------------------------------------------------- 修订差异审计
+
+
+@app.get("/documents/{doc_id}/diff", tags=["documents"])
+def diff_revisions(
+    doc_id: str,
+    from_revision: int = Query(..., ge=1, description="比较起点修订号"),
+    to_revision: int = Query(..., ge=1, description="比较终点修订号"),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """递归比较两个已存在修订的快照，返回结构差异（审计用，只读）。
+
+    * 变更按 RFC 6901 路径稳定排序，每项含 ``op``（add/remove/replace）、
+      ``before``/``after``，键缺失侧在 ``missing`` 中标注（区别于真实 null）；
+      数组作为整体值比较，不按下标展开；
+    * 响应附各操作计数 ``counts``；两快照无差异时 ``changes`` 为空数组；
+    * 文档不存在 → ``404 not_found``；任一修订不存在 → ``404 revision_not_found``，
+      ``missing_revisions`` 指出缺失的修订号。
+    """
+    if db.get_document(conn, doc_id) is None:
+        raise err(status.HTTP_404_NOT_FOUND, "not_found", document_id=doc_id)
+    from_row = db.get_revision(conn, doc_id, from_revision)
+    to_row = db.get_revision(conn, doc_id, to_revision)
+    missing = [
+        revision
+        for revision, row in ((from_revision, from_row), (to_revision, to_row))
+        if row is None
+    ]
+    if missing:
+        raise err(
+            status.HTTP_404_NOT_FOUND,
+            "revision_not_found",
+            document_id=doc_id,
+            from_revision=from_revision,
+            to_revision=to_revision,
+            missing_revisions=missing,
+        )
+    changes = diff_documents(
+        json.loads(from_row["content"]), json.loads(to_row["content"])
+    )
+    return {
+        "document_id": doc_id,
+        "from_revision": from_revision,
+        "to_revision": to_revision,
+        "changes": changes,
+        "counts": diff_counts(changes),
     }
 
 
