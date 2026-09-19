@@ -45,6 +45,11 @@
   不写入修订、不占用 `request_id`（修正后可用同 ID 重试）；
 - 删除契约后，PATCH 立即恢复为无契约的原更新行为。
 
+需要审计两个历史修订之间的差异时，可用 **`GET /documents/{id}/diff?from_revision=&to_revision=`**：
+递归比较两个已存在快照，按 RFC 6901 路径稳定排序返回 `add` / `remove` / `replace` 变更；
+每项同时给出 `before` / `after`，并用 `missing` 区分键缺失与真实 `null`，数组作为整体值比较；
+任一修订不存在返回 `404` 并指出缺失修订，响应附各操作计数，空差异返回空数组。
+
 ## 一键启动
 
 需要 Docker 与 Docker Compose v2：
@@ -97,6 +102,7 @@ docker compose down -v       # 停止并删除数据卷
 | `POST` | `/releases` | 原子发布 2～20 个文档更新（单事务、聚合失败、整批幂等） |
 | `GET` | `/documents/{id}/revisions` | 修订历史（支持 `limit`/`offset`/`order=asc|desc`） |
 | `GET` | `/documents/{id}/revisions/{rev}` | 查询指定修订的内容与 patch |
+| `GET` | `/documents/{id}/diff` | 比较两个修订快照（`from_revision`/`to_revision`），返回按 RFC 6901 路径排序的 add/remove/replace 差异 |
 | `PUT` | `/documents/{id}/schema` | 设置 / 替换 JSON Schema 2020-12 契约 |
 | `GET` | `/documents/{id}/schema` | 查询当前契约（未设置返回 `404 schema_not_found`） |
 | `DELETE` | `/documents/{id}/schema` | 删除契约（幂等，删除后恢复原更新行为） |
@@ -380,6 +386,58 @@ curl http://localhost:8000/documents/demo/revisions/3
 历史列表为轻量条目（修订号、基线号、request_id、是否重放、作者、时间）；
 单条修订详情含完整 `content`、原始 `patch` 与重放标记。
 
+### 修订差异审计（GET /documents/{id}/diff）
+
+只读接口：递归比较 `from_revision` 与 `to_revision` 两个**已存在**快照，
+按 RFC 6901 JSON Pointer 稳定排序返回 `add` / `remove` / `replace` 变更。
+`from_revision` 大于 `to_revision` 也可以（反向审计，`before`/`after` 随之对调）。
+
+```bash
+# 历史：rev1 创建 {"a":1,"b":2,"c":{"x":1},"note":null,"tags":["u"]}
+#       → rev2 a=100 → rev3 删 b、c 下加 y、note 改为 "hi"、tags 追加 "v"
+curl 'http://localhost:8000/documents/demo/diff?from_revision=1&to_revision=3'
+```
+
+```json
+{
+  "document_id": "demo",
+  "from_revision": 1,
+  "to_revision": 3,
+  "changes": [
+    {"op": "replace", "path": "/a",    "before": 1,     "after": 100,        "missing": []},
+    {"op": "remove",  "path": "/b",    "before": 2,     "after": null,       "missing": ["after"]},
+    {"op": "add",     "path": "/c/y",  "before": null,  "after": 2,          "missing": ["before"]},
+    {"op": "replace", "path": "/note", "before": null,  "after": "hi",       "missing": []},
+    {"op": "replace", "path": "/tags", "before": ["u"], "after": ["u", "v"], "missing": []}
+  ],
+  "counts": {"add": 1, "remove": 1, "replace": 3, "total": 5}
+}
+```
+
+变更项字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `op` | `add`（仅新快照有）/ `remove`（仅旧快照有）/ `replace`（两侧都有但值不同） |
+| `path` | 变更位置的 RFC 6901 JSON Pointer，根为 `""`，键中的 `~`/`/` 转义为 `~0`/`~1` |
+| `before` / `after` | 旧 / 新快照在该路径的值；键缺失一侧为 `null` |
+| `missing` | 哪一侧键缺失：`["before"]`（add）、`["after"]`（remove）、`[]`（replace）——据此区分“键不存在”与真实存储的 JSON `null`（如上例 `/note` 的 `before` 是真实 `null`，`missing` 为空） |
+
+语义要点：
+
+- 两侧都是对象才按键递归；**数组与标量作为整体值比较**（不按下标 / 逐字符差分），
+  如上例 `/tags` 整体替换；
+- 新增 / 删除的子树作为**整体值**挂在该路径上，不再向下展开；
+- 结果按 `path` 稳定排序；`counts` 汇总各操作计数与 `total`；
+- 空差异（如 `from_revision == to_revision`）返回 `"changes": []`、计数全 0；
+- 文档不存在 → `404 not_found`；任一修订不存在 → `404 revision_not_found`，
+  `missing_revisions` 指出缺失的修订号：
+
+  ```json
+  {"detail": {"error": "revision_not_found", "document_id": "demo",
+    "from_revision": 1, "to_revision": 99, "missing_revisions": [99]}}
+  ```
+
 ## JSON Schema 契约（可选）
 
 每个文档最多一个契约，遵循 [JSON Schema 2020-12](https://json-schema.org/draft/2020-12)
@@ -505,6 +563,7 @@ HTTP/1.1 422 Unprocessable Entity
 | `201` | 文档创建成功 |
 | `404 not_found` | 文档不存在（契约接口同理） |
 | `404 schema_not_found` | 文档存在但未设置契约（GET） |
+| `404 revision_not_found` | 指定修订不存在（单修订查询 / 差异审计，`missing_revisions` 指出缺失修订） |
 | `409 conflict` | 三方合并存在分歧路径（原子发布单项失败时聚合在 `failures` 中） |
 | `409 revert_conflict` | 撤销目标修订涉及的路径后来被改成不同值（不写新修订、不占用 request_id） |
 | `409 request_id_conflict` | 同一 request_id 对应了不同内容（PATCH 与撤销共用幂等表） |
@@ -521,8 +580,9 @@ HTTP/1.1 422 Unprocessable Entity
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、冲突响应、契约接口）
+│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、冲突响应、契约接口、差异审计）
 │   ├── merge.py       # RFC 7386 打补丁 + 递归三方合并（无框架依赖，可单测）
+│   ├── diff.py        # 两快照递归差异审计（add/remove/replace，无框架依赖，可单测）
 │   ├── validation.py  # JSON Schema 2020-12 元校验与实例校验（错误稳定排序）
 │   ├── db.py          # SQLite 连接、自动建表、文档/修订/幂等/契约表读写
 │   ├── schemas.py     # Pydantic 请求模型（额外字段拒绝）
@@ -532,7 +592,8 @@ HTTP/1.1 422 Unprocessable Entity
 │   ├── test_api.py       # API 集成测试（23 例，独立临时数据库）
 │   ├── test_contracts.py # 契约接口与 PATCH 校验集成测试（19 例）
 │   ├── test_reverts.py   # POST /documents/{id}/reverts 撤销集成测试（25 例）
-│   └── test_releases.py  # POST /releases 原子发布集成测试（17 例）
+│   ├── test_releases.py  # POST /releases 原子发布集成测试（17 例）
+│   └── test_diff.py      # GET /documents/{id}/diff 差异审计集成测试（17 例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
